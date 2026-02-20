@@ -6,10 +6,9 @@
 
 ## 🚀 Live Demo
 
-[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://your-app.streamlit.app)
+[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://imryana-mlmacd-xencoptzxfzymp5uvglpw6.streamlit.app/)
 
-> **[Launch the app →](https://your-app.streamlit.app)**
-> *(Replace with your Streamlit Cloud URL once deployed)*
+> **[Launch the app →](https://imryana-mlmacd-xencoptzxfzymp5uvglpw6.streamlit.app/)**
 
 ---
 
