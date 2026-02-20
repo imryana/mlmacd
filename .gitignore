@@ -1,14 +1,19 @@
 # ── Secrets ───────────────────────────────────────────────────────────────
 .env
 
-# ── Data (large files — not for version control) ──────────────────────────
+# ── Data — large files excluded ───────────────────────────────────────────
 data/raw/
-data/processed/
-models/saved/
+data/processed/pooled_features.parquet
+data/processed/equities/
+models/saved/wf_results.parquet
 models/saved_backup/
 scheduler/scan_log.csv
 scheduler/retrain_log.csv
 data/alerts_log.csv
+
+# ── Data — small outputs tracked (scan results, trade cards) ──────────────
+!data/processed/latest_scan.parquet
+!data/processed/trade_cards.parquet
 
 # ── Python ────────────────────────────────────────────────────────────────
 __pycache__/

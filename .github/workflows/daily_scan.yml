@@ -1,0 +1,69 @@
+name: Daily Scanner
+
+on:
+  schedule:
+    - cron: '30 21 * * 1-5'   # 21:30 UTC Mon–Fri (after US market close)
+  workflow_dispatch:            # Manual trigger from GitHub Actions tab
+
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Download latest price data
+        run: python -m ingestion.downloader
+
+      - name: Build feature parquets
+        run: python -m features.pipeline
+
+      - name: Run signal scanner
+        run: python -m signals.scanner
+
+      - name: Build trade cards
+        run: python -m signals.trade_setup
+
+      - name: Commit scan results
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Stage scan output files
+          git add data/processed/latest_scan.parquet data/processed/trade_cards.parquet
+
+          # Force-add per-ticker parquets for signalled tickers (Stock Detail page)
+          python - <<'EOF'
+          import pathlib, subprocess
+          try:
+              import pandas as pd
+              cards = pathlib.Path("data/processed/trade_cards.parquet")
+              if cards.exists():
+                  tickers = pd.read_parquet(cards)["ticker"].tolist()
+                  for t in tickers:
+                      p = pathlib.Path(f"data/processed/equities/{t}.parquet")
+                      if p.exists():
+                          subprocess.run(["git", "add", "-f", str(p)], check=True)
+                  print(f"Force-added parquets for: {tickers}")
+          except Exception as e:
+              print(f"Warning: could not add ticker parquets: {e}")
+          EOF
+
+          # Only commit if something changed
+          git diff --staged --quiet || git commit -m "chore: daily scan $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git push
