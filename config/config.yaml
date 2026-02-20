@@ -1,0 +1,80 @@
+data:
+  start_date: "2010-01-01"
+  end_date: "today"
+  min_price: 5.0                    # filter bars below this price
+  min_history_days: 504             # minimum 2 years of data per ticker
+
+indicators:
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  rsi_period: 14
+  rsi_overbought: 70
+  rsi_oversold: 30
+  adx_period: 14
+  adx_min_trend: 20                 # below this = choppy, filter out
+  ema_fast: 50
+  ema_slow: 200
+  atr_period: 14
+  bb_period: 20
+  bb_std: 2
+  obv_slope_period: 5
+  volume_ma_period: 20
+  realised_vol_period: 20
+  autocorr_period: 20
+  rolling_return_period: 60
+
+labels:
+  forward_window: 5                 # bars ahead to measure return
+  long_threshold: 0.01              # +1% → long
+  short_threshold: -0.01            # -1% → short
+  # between thresholds → flat
+
+model:
+  confidence_threshold: 0.60
+  walk_forward_train_bars: 504      # ~2 years
+  walk_forward_test_bars: 63        # ~3 months
+  xgb_max_depth: 6
+  xgb_learning_rate: 0.05
+  xgb_n_estimators: 500
+  xgb_subsample: 0.8
+  xgb_min_child_weight: 5
+  xgb_early_stopping_rounds: 50
+  hmm_n_states: 3                   # bull / bear / choppy
+  hmm_n_iter: 100
+  use_gpu: true                     # set false to fall back to CPU training
+
+signals:
+  entry_method: "limit"             # options: next_open, limit, confirmation
+  entry_buffer_atr: 0.25            # limit set 0.25× ATR below close (longs)
+  entry_expiry_bars: 2              # cancel limit if unfilled after 2 bars
+  stop_multiplier: 2.0              # stop = entry ± 2× ATR
+  rr_ratio: 2.0                     # take profit = entry ± 2× risk
+  trailing_stop_activation_atr: 1.0 # activate trailing after 1× ATR move
+  trailing_stop_distance_atr: 1.5   # trail at 1.5× ATR behind price
+  time_exit_bars: 5                 # exit if no trigger after 5 bars
+
+portfolio:
+  size: 50000                       # default portfolio in GBP
+  risk_per_trade: 0.01              # 1% of portfolio per trade
+  max_open_positions: 10
+  max_sector_exposure: 0.30         # max 30% in any one sector
+
+backtest:
+  initial_capital: 50000
+  commission_per_trade: 0.001       # 0.1% per side
+  slippage_atr_fraction: 0.05       # 5% of ATR as slippage estimate
+
+alerts:
+  email_enabled: false
+  email_smtp_server: "smtp.gmail.com"
+  email_port: 587
+  telegram_enabled: false
+  min_confidence_to_alert: 0.65
+
+scheduler:
+  scan_time: "21:00"                # London time, after US close
+  scan_timezone: "Europe/London"
+  retrain_day: "sunday"
+  retrain_time: "08:00"
+  rolling_retrain_window_days: 504  # retrain on most recent 2 years

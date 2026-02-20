@@ -1,0 +1,33 @@
+# ── Secrets ───────────────────────────────────────────────────────────────
+.env
+
+# ── Data (large files — not for version control) ──────────────────────────
+data/raw/
+data/processed/
+models/saved/
+models/saved_backup/
+scheduler/scan_log.csv
+scheduler/retrain_log.csv
+data/alerts_log.csv
+
+# ── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# ── Editors ───────────────────────────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ── Jupyter ───────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+notebooks/.ipynb_checkpoints/
