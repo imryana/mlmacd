@@ -29,17 +29,17 @@ SCAN_OUTPUTS = [
 
 def run(label: str, module: str) -> None:
     """Run a pipeline module, printing progress. Exits on failure."""
-    print(f"\n{'─'*50}")
+    print(f"\n{'-'*50}")
     print(f"  {label}")
-    print(f"{'─'*50}")
+    print(f"{'-'*50}")
     result = subprocess.run(
         [PYTHON, "-m", module],
         cwd=str(ROOT),
     )
     if result.returncode != 0:
-        print(f"\n✗  {label} failed. Aborting.")
+        print(f"\nFAILED  {label} failed. Aborting.")
         sys.exit(1)
-    print(f"✓  {label} done.")
+    print(f"OK  {label} done.")
 
 
 def git(*args: str) -> subprocess.CompletedProcess:
@@ -48,9 +48,9 @@ def git(*args: str) -> subprocess.CompletedProcess:
 
 def push_results() -> None:
     """Stage scan outputs + signalled ticker parquets, commit, and push."""
-    print(f"\n{'─'*50}")
+    print(f"\n{'-'*50}")
     print("  Pushing results to GitHub")
-    print(f"{'─'*50}")
+    print(f"{'-'*50}")
 
     # Stage scan output files
     for f in SCAN_OUTPUTS:
@@ -89,7 +89,7 @@ def push_results() -> None:
         print(f"  Git push failed:\n{result.stderr}")
         sys.exit(1)
 
-    print(f"✓  Pushed — Streamlit Cloud will update shortly.")
+    print("OK  Pushed — Streamlit Cloud will update shortly.")
 
 
 def main() -> None:

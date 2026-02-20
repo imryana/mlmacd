@@ -118,6 +118,15 @@ def download_ticker(
     ohlcv_cols = [c for c in ["open", "high", "low", "close", "volume"] if c in raw.columns]
     raw = raw[ohlcv_cols]
 
+    # Drop zero-volume bars — these are data artifacts (trading halts, yfinance
+    # quirks) not genuine trading days. Keeping them would distort volume-based
+    # features; dropping them is preferable to rejecting the entire ticker.
+    zero_vol = (raw["volume"] <= 0)
+    if zero_vol.any():
+        n = int(zero_vol.sum())
+        log.debug("Dropping %d zero-volume bar(s) for %s", n, ticker)
+        raw = raw[~zero_vol]
+
     if existing is not None and not existing.empty:
         raw = pd.concat([existing, raw])
         raw = raw[~raw.index.duplicated(keep="last")]
@@ -158,18 +167,24 @@ def validate_ticker(df: pd.DataFrame, cfg: dict) -> tuple[bool, str]:
     if len(df) < min_days:
         return False, f"Only {len(df)} bars (need {min_days})"
 
-    # Detect runs of > 7 calendar-day gaps between adjacent rows.
+    # Detect runs of > 14 calendar-day gaps between adjacent rows.
+    # 7 days was too tight: the US year-end holiday window (Christmas + New Year)
+    # produces 8-10 calendar-day gaps between valid trading days, causing false
+    # rejections of otherwise clean data. 14 days catches genuine extended halts
+    # (10+ trading days missing) while ignoring normal holiday closures.
     date_idx = pd.DatetimeIndex(df.index)
     if len(date_idx) > 1:
         gaps = (date_idx[1:] - date_idx[:-1]).days
-        if (gaps > 7).any():
-            return False, "Gap of more than 5 consecutive missing trading days"
+        if (gaps > 14).any():
+            return False, "Gap of more than 10 consecutive missing trading days"
 
-    if (df["close"] < min_price).any():
-        return False, f"Price dropped below min_price={min_price}"
-
-    if (df["volume"] <= 0).any():
-        return False, "Zero or negative volume on at least one bar"
+    # Check min_price against the most recent 252 bars (1 trading year) only.
+    # Checking all history would incorrectly reject stocks that have done multiple
+    # splits — their split-adjusted 2010 prices can be fractions of a dollar even
+    # though the stock currently trades at hundreds of dollars (e.g. NVDA, NFLX).
+    recent = df.tail(252)
+    if (recent["close"] < min_price).any():
+        return False, f"Recent price dropped below min_price={min_price}"
 
     return True, ""
 

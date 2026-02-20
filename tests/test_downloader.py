@@ -71,19 +71,20 @@ def test_validate_price_below_min():
 
 
 def test_validate_zero_volume():
-    """A bar with zero volume should fail."""
+    """Zero-volume bars are dropped by download_ticker before validation.
+    validate_ticker itself no longer rejects zero-volume data."""
     df = _make_ohlcv(600)
     df.loc[df.index[50], "volume"] = 0
     ok, reason = validate_ticker(df, _CFG)
-    assert not ok
-    assert "volume" in reason.lower()
+    # validate_ticker passes; zero-volume cleanup is the downloader's job.
+    assert ok, f"validate_ticker should pass; got: {reason}"
 
 
 def test_validate_large_gap():
-    """A gap of > 7 calendar days between adjacent rows should fail."""
+    """A gap of > 14 calendar days between adjacent rows should fail."""
     df = _make_ohlcv(600)
-    # Remove 10 rows in the middle to create a calendar gap > 7 days.
-    drop_slice = df.index[200:210]
+    # Remove 16 business days (~22+ calendar days) to guarantee > 14 day gap.
+    drop_slice = df.index[200:216]
     df = df.drop(drop_slice)
     ok, reason = validate_ticker(df, _CFG)
     assert not ok
