@@ -16,7 +16,7 @@
 
 Every trading day the pipeline:
 
-1. **Downloads** the latest OHLCV price bars for 427 S&P 500 stocks (via yfinance)
+1. **Downloads** the latest OHLCV price bars for 496 S&P 500 stocks (via yfinance)
 2. **Computes** 33 technical features per stock (MACD, RSI, ATR, EMA, ADX, Bollinger Bands, OBV, volume, volatility)
 3. **Classifies** the market regime for each stock using a 3-state Hidden Markov Model (bull / bear / choppy)
 4. **Scores** each stock with a pooled XGBoost classifier → outputs a Long / Flat / Short signal with a confidence score
@@ -88,11 +88,11 @@ For every signal that passes filters, the pipeline computes:
 
 | Item | Detail |
 |------|--------|
-| **Universe** | 427 S&P 500 stocks (76 excluded — insufficient history or data quality) |
+| **Universe** | 496 S&P 500 stocks (7 excluded — insufficient history or genuine data gaps) |
 | **History** | 2010–present (~15 years per ticker) |
-| **Total rows** | 1,551,959 bar-level observations |
+| **Total rows** | 1,808,816 bar-level observations |
 | **Walk-forward folds** | 53 (504-bar train / 63-bar test, sliding) |
-| **Test set size** | 1,361,326 out-of-sample predictions |
+| **Test set size** | 1,586,429 out-of-sample predictions |
 | **Labels** | 5-bar forward return: Long (>+1%), Short (<-1%), Flat (between) |
 
 ### Out-of-Sample Performance
@@ -100,10 +100,10 @@ For every signal that passes filters, the pipeline computes:
 | Metric | Value |
 |--------|-------|
 | Accuracy | 40.6% (3-class, random = 33%) |
-| Signal hit rate | 53.4% |
-| Mean signal return | +0.23% per 5-bar hold |
-| Signal Sharpe | 0.82 |
-| Weighted F1 | 0.370 |
+| Signal hit rate | 53.1% |
+| Mean signal return | +0.21% per 5-bar hold |
+| Signal Sharpe | 0.72 |
+| Weighted F1 | 0.368 |
 
 ### Top 10 Features by SHAP Importance
 
