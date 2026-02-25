@@ -124,3 +124,66 @@ def test_distribution_has_all_classes():
     out  = add_labels(df, _CFG)
     dist = label_distribution(out)
     assert set(dist.index) == {-1, 0, 1}
+
+
+# ── Binary label columns ──────────────────────────────────────────────────
+
+
+def test_label_long_column_exists():
+    """add_labels must produce a label_long column."""
+    df  = _make_close(100)
+    out = add_labels(df, _CFG)
+    assert "label_long" in out.columns
+
+
+def test_label_short_column_exists():
+    """add_labels must produce a label_short column."""
+    df  = _make_close(100)
+    out = add_labels(df, _CFG)
+    assert "label_short" in out.columns
+
+
+def test_label_long_binary_values():
+    """label_long must contain only 0 and 1."""
+    df  = _make_close(200)
+    out = add_labels(df, _CFG)
+    assert set(out["label_long"].unique()).issubset({0, 1})
+
+
+def test_label_short_binary_values():
+    """label_short must contain only 0 and 1."""
+    df  = _make_close(200)
+    out = add_labels(df, _CFG)
+    assert set(out["label_short"].unique()).issubset({0, 1})
+
+
+def test_label_long_consistent_with_forward_return():
+    """label_long == 1 iff forward_return > long_threshold."""
+    df  = _make_close(200)
+    out = add_labels(df, _CFG)
+    expected = (out["forward_return"] > _CFG["labels"]["long_threshold"]).astype(int)
+    pd.testing.assert_series_equal(
+        out["label_long"].reset_index(drop=True),
+        expected.reset_index(drop=True),
+        check_names=False,
+    )
+
+
+def test_label_short_consistent_with_forward_return():
+    """label_short == 1 iff forward_return < short_threshold."""
+    df  = _make_close(200)
+    out = add_labels(df, _CFG)
+    expected = (out["forward_return"] < _CFG["labels"]["short_threshold"]).astype(int)
+    pd.testing.assert_series_equal(
+        out["label_short"].reset_index(drop=True),
+        expected.reset_index(drop=True),
+        check_names=False,
+    )
+
+
+def test_label_long_short_mutually_exclusive():
+    """label_long and label_short cannot both be 1 on the same row."""
+    df  = _make_close(200)
+    out = add_labels(df, _CFG)
+    both = (out["label_long"] == 1) & (out["label_short"] == 1)
+    assert not both.any(), "label_long and label_short are both 1 on some rows"

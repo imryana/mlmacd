@@ -5,12 +5,17 @@ For each ticker with a processed feature file:
   1. Load features from data/processed/equities/{ticker}.parquet
   2. Predict per-bar regime with the fitted HMM (full sequence)
   3. Get the most recent bar's feature vector
-  4. Run XGBoost predict_signal()
-  5. Apply three filters:
-       - confidence  < config.model.confidence_threshold   → skip
+  4. Run long model and short model independently:
+       long_conf  = P(return > +threshold)
+       short_conf = P(return < -threshold)
+  5. Apply signal logic:
+       long_conf  > threshold → LONG
+       short_conf > threshold → SHORT  (only if LONG not triggered)
+       otherwise               → FLAT (skip)
+  6. Apply three additional filters:
        - ADX         < config.indicators.adx_min_trend     → skip
        - regime == choppy AND signal != flat                → skip
-  6. Collect and rank passing signals by confidence (descending)
+  7. Collect and rank passing signals by confidence (descending)
 
 Output saved to data/processed/latest_scan.parquet.
 """
@@ -22,9 +27,10 @@ import pandas as pd
 import yaml
 
 from features.indicators import FEATURE_COLUMNS
+from features.macro import compute_macro_features
 from models.trainer import _get_feature_columns
-from models.xgboost_model import XGBoostModel
-from regime.hmm_detector import CHOPPY, HMMDetector
+from models.xgboost_model import XGBoostBinaryModel
+from regime.hmm_detector import BEAR, CHOPPY, HMMDetector
 
 log = logging.getLogger(__name__)
 
@@ -52,13 +58,17 @@ def _scan_output_path() -> pathlib.Path:
     return _ROOT / "data" / "processed" / "latest_scan.parquet"
 
 
-def _final_model_path() -> pathlib.Path:
-    return _ROOT / "models" / "saved" / "xgboost_final.pkl"
+def _long_model_path() -> pathlib.Path:
+    return _ROOT / "models" / "saved" / "long_model.pkl"
+
+
+def _short_model_path() -> pathlib.Path:
+    return _ROOT / "models" / "saved" / "short_model.pkl"
 
 
 # ── Feature column helper ─────────────────────────────────────────────────
 
-#: All feature columns fed to XGBoost (indicators + regime)
+#: All feature columns fed to XGBoost (indicators + macro + regime)
 _XGB_FEATURE_COLS = FEATURE_COLUMNS + ["regime"]
 
 
@@ -73,9 +83,12 @@ _REGIME_NAMES = {0: "choppy", 1: "bull", 2: "bear"}
 
 def run_scan(
     cfg: dict,
-    xgb_model: XGBoostModel | None = None,
+    long_model: XGBoostBinaryModel | None = None,
+    short_model: XGBoostBinaryModel | None = None,
     detector: HMMDetector | None = None,
     universe: pd.DataFrame | None = None,
+    # Legacy parameter kept for backward compatibility in tests
+    xgb_model=None,
 ) -> pd.DataFrame:
     """
     Scan all tickers with available processed data and return ranked signals.
@@ -84,35 +97,55 @@ def run_scan(
     ----------
     cfg : dict
         Full config dict from config.yaml.
-    xgb_model : XGBoostModel, optional
-        Pre-loaded model (avoids repeated disk reads in batch jobs).
+    long_model : XGBoostBinaryModel, optional
+        Pre-loaded long-side binary model.
+    short_model : XGBoostBinaryModel, optional
+        Pre-loaded short-side binary model.
     detector : HMMDetector, optional
         Pre-loaded HMM detector.
     universe : pd.DataFrame, optional
         Universe DataFrame with ``ticker``, ``company``, ``sector`` columns.
         If None, loaded from disk.
+    xgb_model : (deprecated)
+        Legacy single-model argument; ignored if long_model is provided.
 
     Returns
     -------
     pd.DataFrame
         Columns: ticker, company, sector, signal, signal_name, confidence,
                  regime, regime_name, adx, rsi, macd_histogram, price,
-                 atr, date.
+                 atr, date, long_conf, short_conf.
         Sorted by confidence descending.  Empty if no signals pass filters.
     """
     conf_thresh = cfg["model"]["confidence_threshold"]
     adx_thresh  = cfg["indicators"]["adx_min_trend"]
 
     # ── Load models ───────────────────────────────────────────────────────
-    if xgb_model is None:
-        model_path = _final_model_path()
-        if not model_path.exists():
+    # Support legacy single-model callers (e.g. older tests)
+    if long_model is None and xgb_model is not None:
+        # Wrap the legacy model: treat its predict_signal as long-only
+        long_model  = _LegacyModelAdapter(xgb_model)
+        short_model = None
+
+    if long_model is None:
+        lpath = _long_model_path()
+        if not lpath.exists():
             raise FileNotFoundError(
-                f"Trained model not found at {model_path}. "
+                f"Long model not found at {lpath}. "
                 "Run `python -m models.trainer` first."
             )
-        xgb_model = XGBoostModel.load(model_path, cfg)
-        log.info("XGBoost model loaded.")
+        long_model = XGBoostBinaryModel.load(lpath, cfg)
+        log.info("Long model loaded.")
+
+    if short_model is None and xgb_model is None:
+        spath = _short_model_path()
+        if not spath.exists():
+            raise FileNotFoundError(
+                f"Short model not found at {spath}. "
+                "Run `python -m models.trainer` first."
+            )
+        short_model = XGBoostBinaryModel.load(spath, cfg)
+        log.info("Short model loaded.")
 
     if detector is None:
         detector = HMMDetector.load(cfg)
@@ -126,6 +159,15 @@ def run_scan(
         row["ticker"]: {"company": row["company"], "sector": row["sector"]}
         for _, row in universe.iterrows()
     }
+
+    # ── Load latest macro features (once, shared across all tickers) ─────────
+    macro_df = compute_macro_features(cfg)
+    latest_macro: dict = {}
+    if not macro_df.empty:
+        latest_macro = macro_df.iloc[-1].to_dict()
+        log.info("Latest macro loaded (date=%s).", macro_df.index[-1].date())
+    else:
+        log.warning("Macro features unavailable — macro cols will be zeroed.")
 
     # ── Per-ticker inference ──────────────────────────────────────────────
     signals: list[dict] = []
@@ -153,20 +195,32 @@ def run_scan(
         df = df.copy()
         df["regime"] = regime_series
 
-        # Latest bar
-        latest    = df.iloc[-1]
-        feat_row  = latest[_XGB_FEATURE_COLS].to_frame().T
+        # Latest bar — inject macro features, then build feature row
+        latest   = df.iloc[-1].copy()
+        for col, val in latest_macro.items():
+            latest[col] = val
+        feat_cols = [c for c in _XGB_FEATURE_COLS if c in latest.index]
+        feat_row  = latest[feat_cols].to_frame().T
 
-        sig_arr, conf_arr = xgb_model.predict_signal(feat_row)
-        signal     = int(sig_arr[0])
-        confidence = float(conf_arr[0])
-        regime     = int(latest["regime"])
+        # ── Dual model inference ──────────────────────────────────────────
+        long_conf  = float(long_model.predict_proba(feat_row)[0])
+        if short_model is not None:
+            short_conf = float(short_model.predict_proba(feat_row)[0])
+        else:
+            short_conf = 0.0
 
+        if long_conf > conf_thresh:
+            signal, confidence = 1, long_conf
+        elif short_conf > conf_thresh:
+            signal, confidence = -1, short_conf
+        else:
+            signal, confidence = 0, max(long_conf, short_conf)
+
+        regime = int(latest["regime"])
         processed_count += 1
 
         # ── Filters ───────────────────────────────────────────────────────
-        if confidence < conf_thresh:
-            skipped_filter += 1
+        if signal == 0:
             continue
         if float(latest["adx"]) < adx_thresh:
             skipped_filter += 1
@@ -174,7 +228,8 @@ def run_scan(
         if regime == CHOPPY and signal != 0:
             skipped_filter += 1
             continue
-        if signal == 0:   # flat signals are not actionable trade alerts
+        if signal == -1 and regime != BEAR:
+            skipped_filter += 1
             continue
 
         info = ticker_info.get(ticker, {"company": "", "sector": ""})
@@ -194,6 +249,8 @@ def run_scan(
                 "price":          round(float(latest["close"]),         4),
                 "atr":            round(float(latest["atr"]),           4),
                 "date":           df.index[-1].date().isoformat(),
+                "long_conf":      round(long_conf,  4),
+                "short_conf":     round(short_conf, 4),
             }
         )
 
@@ -209,6 +266,7 @@ def run_scan(
                 "ticker", "company", "sector", "signal", "signal_name",
                 "confidence", "regime", "regime_name", "adx", "rsi",
                 "macd_histogram", "price", "atr", "date",
+                "long_conf", "short_conf",
             ]
         )
 
@@ -220,6 +278,23 @@ def run_scan(
     result.index += 1   # 1-based rank
     result.index.name = "rank"
     return result
+
+
+# ── Legacy adapter ────────────────────────────────────────────────────────
+
+class _LegacyModelAdapter:
+    """Wraps the old XGBoostModel (multi-class) to behave like a binary long model."""
+
+    def __init__(self, model):
+        self._m = model
+
+    def predict_proba(self, X):
+        """Return P(long) from the multi-class model (column index 2 = class +1)."""
+        import numpy as np
+        proba = self._m.predict_proba(X)
+        if proba.ndim == 2 and proba.shape[1] == 3:
+            return proba[:, 2]          # P(long)
+        return proba[:, -1]
 
 
 # ── Entry point ───────────────────────────────────────────────────────────

@@ -18,6 +18,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from features.indicators import FEATURE_COLUMNS
 from signals.scanner import _SIGNAL_NAMES, _XGB_FEATURE_COLS, run_scan
+from models.xgboost_model import XGBoostBinaryModel
 
 # ── helpers ───────────────────────────────────────────────────────────────
 
@@ -64,13 +65,31 @@ def _make_processed_df(
     return df
 
 
+def _make_mock_binary_model(proba: float = 0.75):
+    """Return a mock XGBoostBinaryModel with deterministic predict_proba."""
+    mock = MagicMock(spec=XGBoostBinaryModel)
+    mock.predict_proba.return_value = np.array([proba])
+    return mock
+
+
 def _make_mock_xgb(signal: int = 1, confidence: float = 0.75):
-    """Return a mock XGBoostModel with deterministic output."""
+    """
+    Legacy helper — returns a mock with predict_proba compatible with
+    the _LegacyModelAdapter (3-class probability array).
+    """
     mock = MagicMock()
     mock.predict_signal.return_value = (
         np.array([signal]),
         np.array([confidence]),
     )
+    # Also mock predict_proba for the _LegacyModelAdapter path
+    # Column layout: [P(short), P(flat), P(long)]
+    if signal == 1:
+        mock.predict_proba.return_value = np.array([[0.05, 0.20, confidence]])
+    elif signal == -1:
+        mock.predict_proba.return_value = np.array([[confidence, 0.20, 0.05]])
+    else:
+        mock.predict_proba.return_value = np.array([[0.15, confidence, 0.15]])
     return mock
 
 
@@ -104,7 +123,8 @@ def test_run_scan_returns_dataframe(tmp_path):
     with patch("signals.scanner._processed_path", return_value=tmp_path / "none.parquet"):
         result = run_scan(
             _CFG,
-            xgb_model=_make_mock_xgb(),
+            long_model=_make_mock_binary_model(0.75),
+            short_model=_make_mock_binary_model(0.10),
             detector=_make_mock_detector(),
             universe=_make_universe(),
         )
@@ -112,7 +132,7 @@ def test_run_scan_returns_dataframe(tmp_path):
 
 
 def test_run_scan_returns_signal_above_threshold(tmp_path):
-    """A ticker with confidence=0.75 and ADX=25 should appear in results."""
+    """A ticker with long_conf=0.75 and ADX=25 should appear as LONG."""
     df = _make_processed_df(adx=25.0)
 
     def fake_path(ticker):
@@ -124,7 +144,8 @@ def test_run_scan_returns_signal_above_threshold(tmp_path):
     with patch("signals.scanner._processed_path", side_effect=fake_path):
         result = run_scan(
             _CFG,
-            xgb_model=_make_mock_xgb(signal=1, confidence=0.75),
+            long_model=_make_mock_binary_model(0.75),
+            short_model=_make_mock_binary_model(0.10),
             detector=_make_mock_detector(regime=1),
             universe=_make_universe(["AAPL"]),
         )
@@ -134,7 +155,7 @@ def test_run_scan_returns_signal_above_threshold(tmp_path):
 
 
 def test_run_scan_filters_low_confidence(tmp_path):
-    """confidence=0.50 < threshold=0.60 → signal must be excluded."""
+    """Both model probas < threshold=0.60 → signal must be excluded."""
     df = _make_processed_df(adx=25.0)
 
     def fake_path(ticker):
@@ -146,7 +167,8 @@ def test_run_scan_filters_low_confidence(tmp_path):
     with patch("signals.scanner._processed_path", side_effect=fake_path):
         result = run_scan(
             _CFG,
-            xgb_model=_make_mock_xgb(signal=1, confidence=0.50),
+            long_model=_make_mock_binary_model(0.50),
+            short_model=_make_mock_binary_model(0.45),
             detector=_make_mock_detector(regime=1),
             universe=_make_universe(["AAPL"]),
         )
@@ -167,7 +189,8 @@ def test_run_scan_filters_low_adx(tmp_path):
     with patch("signals.scanner._processed_path", side_effect=fake_path):
         result = run_scan(
             _CFG,
-            xgb_model=_make_mock_xgb(signal=1, confidence=0.75),
+            long_model=_make_mock_binary_model(0.75),
+            short_model=_make_mock_binary_model(0.10),
             detector=_make_mock_detector(regime=1),
             universe=_make_universe(["AAPL"]),
         )
@@ -188,12 +211,60 @@ def test_run_scan_filters_choppy_regime(tmp_path):
     with patch("signals.scanner._processed_path", side_effect=fake_path):
         result = run_scan(
             _CFG,
-            xgb_model=_make_mock_xgb(signal=1, confidence=0.75),
+            long_model=_make_mock_binary_model(0.75),
+            short_model=_make_mock_binary_model(0.10),
             detector=_make_mock_detector(regime=0),   # choppy
             universe=_make_universe(["AAPL"]),
         )
 
     assert result.empty
+
+
+def test_run_scan_short_signal(tmp_path):
+    """short_conf > threshold in bear regime → signal == -1."""
+    df = _make_processed_df(adx=25.0)
+
+    def fake_path(ticker):
+        p = tmp_path / f"{ticker}.parquet"
+        if not p.exists():
+            df.to_parquet(p)
+        return p
+
+    with patch("signals.scanner._processed_path", side_effect=fake_path):
+        result = run_scan(
+            _CFG,
+            long_model=_make_mock_binary_model(0.10),   # below threshold
+            short_model=_make_mock_binary_model(0.75),  # above threshold
+            detector=_make_mock_detector(regime=2),     # bear regime
+            universe=_make_universe(["AAPL"]),
+        )
+
+    assert len(result) > 0
+    assert result.iloc[0]["signal"] == -1
+
+
+def test_run_scan_short_suppressed_in_non_bear_regime(tmp_path):
+    """Short signal in bull or choppy regime must be suppressed."""
+    df = _make_processed_df(adx=25.0)
+
+    def fake_path(ticker):
+        p = tmp_path / f"{ticker}.parquet"
+        if not p.exists():
+            df.to_parquet(p)
+        return p
+
+    for non_bear_regime in (1, 0):   # bull=1, choppy=0
+        with patch("signals.scanner._processed_path", side_effect=fake_path):
+            result = run_scan(
+                _CFG,
+                long_model=_make_mock_binary_model(0.10),
+                short_model=_make_mock_binary_model(0.75),
+                detector=_make_mock_detector(regime=non_bear_regime),
+                universe=_make_universe(["AAPL"]),
+            )
+        assert result.empty, (
+            f"Expected no signals in regime={non_bear_regime}, got {len(result)}"
+        )
 
 
 def test_run_scan_sorted_by_confidence_descending(tmp_path):
@@ -211,18 +282,20 @@ def test_run_scan_sorted_by_confidence_descending(tmp_path):
 
     call_count = [0]
 
-    def mock_predict_signal(X):
+    def mock_proba(X):
         i = call_count[0] % len(confs)
         call_count[0] += 1
-        return np.array([1]), np.array([confs[i]])
+        return np.array([confs[i]])
 
-    mock_xgb = MagicMock()
-    mock_xgb.predict_signal.side_effect = mock_predict_signal
+    mock_long = MagicMock(spec=XGBoostBinaryModel)
+    mock_long.predict_proba.side_effect = mock_proba
+    mock_short = _make_mock_binary_model(0.10)
 
     with patch("signals.scanner._processed_path", side_effect=fake_path):
         result = run_scan(
             _CFG,
-            xgb_model=mock_xgb,
+            long_model=mock_long,
+            short_model=mock_short,
             detector=_make_mock_detector(regime=1),
             universe=_make_universe(tickers),
         )
@@ -245,7 +318,8 @@ def test_run_scan_required_output_columns(tmp_path):
     with patch("signals.scanner._processed_path", side_effect=fake_path):
         result = run_scan(
             _CFG,
-            xgb_model=_make_mock_xgb(signal=1, confidence=0.75),
+            long_model=_make_mock_binary_model(0.75),
+            short_model=_make_mock_binary_model(0.10),
             detector=_make_mock_detector(regime=1),
             universe=_make_universe(["AAPL"]),
         )
@@ -259,7 +333,8 @@ def test_run_scan_empty_universe(tmp_path):
     """Empty universe should return empty DataFrame without error."""
     result = run_scan(
         _CFG,
-        xgb_model=_make_mock_xgb(),
+        long_model=_make_mock_binary_model(0.75),
+        short_model=_make_mock_binary_model(0.10),
         detector=_make_mock_detector(),
         universe=_make_universe([]),
     )

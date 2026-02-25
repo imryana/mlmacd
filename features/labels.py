@@ -62,13 +62,20 @@ def add_labels(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     choices = [1, -1]
     df["label"] = np.select(conditions, choices, default=0)
 
+    # Binary labels for separate long / short models
+    df["label_long"]  = (df["forward_return"] > long_threshold).astype(int)
+    df["label_short"] = (df["forward_return"] < short_threshold).astype(int)
+
     # Drop the last N rows where the future close is unknown
     df = df.iloc[:-window].copy()
 
     log.debug(
-        "Labels added: %d rows remaining.  Distribution: %s",
+        "Labels added: %d rows remaining.  Distribution: %s  "
+        "label_long=%d  label_short=%d",
         len(df),
         df["label"].value_counts().to_dict(),
+        int(df["label_long"].sum()),
+        int(df["label_short"].sum()),
     )
     return df
 

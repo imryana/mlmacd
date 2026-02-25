@@ -23,6 +23,7 @@ from tqdm import tqdm
 
 from features.indicators import FEATURE_COLUMNS, calculate_indicators
 from features.labels import add_labels
+from features.macro import compute_macro_features, download_macro
 
 log = logging.getLogger(__name__)
 
@@ -121,9 +122,12 @@ def process_ticker(
         df  = calculate_indicators(raw, cfg, sector_code=sector_code)
         df  = add_labels(df, cfg)
 
-        # Drop rows where any feature column is NaN (warmup period)
+        # Drop rows where any feature column is NaN (warmup period).
+        # Macro columns are joined at the pooled level so only drop on columns
+        # that are already present in the per-ticker DataFrame.
         before = len(df)
-        df = df.dropna(subset=FEATURE_COLUMNS)
+        drop_cols = [c for c in FEATURE_COLUMNS if c in df.columns]
+        df = df.dropna(subset=drop_cols)
         dropped = before - len(df)
         if dropped:
             log.debug("%s: dropped %d NaN rows (warmup).", ticker, dropped)
@@ -187,6 +191,17 @@ def run_pipeline(
     if frames:
         pooled = pd.concat(frames, axis=0)
         pooled.sort_values(["ticker", pooled.index.name or "date"], inplace=True)
+
+        # ── Merge macro features by date ──────────────────────────────────
+        macro_df = compute_macro_features(cfg)
+        if not macro_df.empty:
+            macro_cols = list(macro_df.columns)
+            pooled = pooled.join(macro_df, how="left")
+            pooled[macro_cols] = pooled[macro_cols].ffill()
+            log.info("Macro features merged: %s", macro_cols)
+        else:
+            log.warning("Macro features unavailable — run download_macro() first.")
+
         pooled_path = _pooled_path()
         pooled_path.parent.mkdir(parents=True, exist_ok=True)
         pooled.to_parquet(pooled_path)
@@ -203,12 +218,22 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 
     cfg      = _load_config()
+
+    # Fetch / update VIX and SPY macro data first
+    log.info("Downloading macro data (VIX + SPY)...")
+    download_macro(cfg)
+
     universe = pd.read_csv(_universe_path())
     sector_map = build_sector_map(universe)
 
     # Only process tickers that have a downloaded raw file
     raw_dir = _ROOT / "data" / "raw" / "equities"
     available = [p.stem for p in sorted(raw_dir.glob("*.parquet"))]
+
+    ticker_filter = cfg["data"].get("tickers")
+    if ticker_filter:
+        available = [t for t in available if t in ticker_filter]
+        log.info("Ticker filter active: %s", available)
 
     if not available:
         raise FileNotFoundError(

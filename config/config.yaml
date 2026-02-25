@@ -1,4 +1,5 @@
 data:
+  tickers: null   # null = all S&P 500
   start_date: "2010-01-01"
   end_date: "today"
   min_price: 1.0                    # filter bars below this price (1.0 avoids false-rejecting S&P 500 members that temporarily dipped)
@@ -25,9 +26,9 @@ indicators:
   rolling_return_period: 60
 
 labels:
-  forward_window: 5                 # bars ahead to measure return
-  long_threshold: 0.01              # +1% → long
-  short_threshold: -0.01            # -1% → short
+  forward_window: 21                # bars ahead to measure return (~1 month)
+  long_threshold: 0.03              # +3% → long
+  short_threshold: -0.03            # -3% → short
   # between thresholds → flat
 
 model:
@@ -47,12 +48,12 @@ model:
 signals:
   entry_method: "limit"             # options: next_open, limit, confirmation
   entry_buffer_atr: 0.25            # limit set 0.25× ATR below close (longs)
-  entry_expiry_bars: 2              # cancel limit if unfilled after 2 bars
+  entry_expiry_bars: 5              # cancel limit if unfilled after 5 bars
   stop_multiplier: 2.0              # stop = entry ± 2× ATR
   rr_ratio: 2.0                     # take profit = entry ± 2× risk
   trailing_stop_activation_atr: 1.0 # activate trailing after 1× ATR move
   trailing_stop_distance_atr: 1.5   # trail at 1.5× ATR behind price
-  time_exit_bars: 5                 # exit if no trigger after 5 bars
+  time_exit_bars: 21                # exit if no trigger after 21 bars (~1 month)
 
 portfolio:
   size: 50000                       # default portfolio in GBP
@@ -64,6 +65,14 @@ backtest:
   initial_capital: 50000
   commission_per_trade: 0.001       # 0.1% per side
   slippage_atr_fraction: 0.05       # 5% of ATR as slippage estimate
+
+macro:                              # Market-wide context features
+  vix_ticker: "^VIX"
+  spy_ticker: "SPY"
+  vix_pct_rank_window: 252
+  spy_rsi_period: 14
+  spy_ema_period: 200
+  spy_return_period: 20
 
 alerts:
   email_enabled: false

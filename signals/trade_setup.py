@@ -15,6 +15,7 @@ For every signal row produced by scanner.run_scan(), this module computes:
     trailing_activation — entry ± ATR × trailing_stop_activation_atr
     trailing_distance   — ATR × trailing_stop_distance_atr
     time_exit           — today + time_exit_bars business days
+                          (both exit params come from config, not hardcoded)
 
   Position sizing (from config.portfolio)
     risk_amount      — portfolio_size × risk_per_trade
@@ -23,7 +24,7 @@ For every signal row produced by scanner.run_scan(), this module computes:
     position_pct     — position_value / portfolio_size × 100
 
   SHAP top-5 drivers
-    Per-bar SHAP values computed from the saved XGBoost model.
+    Per-bar SHAP values computed from the saved long/short XGBoost binary models.
 
 Full trade cards saved to data/processed/trade_cards.parquet.
 """
@@ -39,11 +40,12 @@ import shap
 import yaml
 
 from features.indicators import FEATURE_COLUMNS
-from models.xgboost_model import XGBoostModel
+from models.xgboost_model import XGBoostBinaryModel
 from regime.hmm_detector import HMMDetector
 from signals.scanner import (
     _SIGNAL_NAMES,
-    _final_model_path,
+    _long_model_path,
+    _short_model_path,
     _processed_path,
     _universe_path,
     run_scan,
@@ -94,24 +96,23 @@ def _add_bdays(ref_date: date, n: int) -> date:
 
 
 def _compute_shap_top5(
-    model: XGBoostModel,
+    model: XGBoostBinaryModel,
     X_row: pd.DataFrame,
 ) -> list[dict]:
     """
     Compute SHAP values for a single feature row and return the top 5
-    features by absolute SHAP value (averaged across classes).
+    features by absolute SHAP value.
 
     Parameters
     ----------
-    model : XGBoostModel
+    model : XGBoostBinaryModel
     X_row : pd.DataFrame
         Single-row feature DataFrame.
 
     Returns
     -------
     list[dict]
-        Up to 5 dicts with keys ``feature``, ``shap_value``, ``direction``
-        (``"positive"`` or ``"negative"``).
+        Up to 5 dicts with keys ``feature``, ``shap_value``, ``direction``.
     """
     try:
         with warnings.catch_warnings():
@@ -119,14 +120,16 @@ def _compute_shap_top5(
             explainer   = shap.TreeExplainer(model.model)
             shap_values = explainer.shap_values(X_row)
 
-        # shap_values: list of (1, n_features) arrays or (1, n_features, n_classes)
+        # Binary model: shap_values may be (1, n_features) or a list
         if isinstance(shap_values, list):
-            mean_shap = np.mean([sv[0] for sv in shap_values], axis=0)
+            mean_shap = shap_values[-1][0]   # positive class, first (only) row
+        elif shap_values.ndim == 3:
+            mean_shap = shap_values[0].mean(axis=-1)
         else:
-            mean_shap = shap_values[0].mean(axis=-1)   # average over classes
+            mean_shap = shap_values[0]       # (n_features,)
 
-        features   = list(X_row.columns)
-        top_idx    = np.argsort(np.abs(mean_shap))[::-1][:5]
+        features = list(X_row.columns)
+        top_idx  = np.argsort(np.abs(mean_shap))[::-1][:5]
         return [
             {
                 "feature":    features[i],
@@ -146,8 +149,11 @@ def _compute_shap_top5(
 def build_trade_card(
     signal_row: pd.Series,
     cfg: dict,
-    xgb_model: XGBoostModel | None = None,
+    long_model: XGBoostBinaryModel | None = None,
+    short_model: XGBoostBinaryModel | None = None,
     detector: HMMDetector | None = None,
+    # Legacy parameter
+    xgb_model=None,
 ) -> dict:
     """
     Build a complete trade card dictionary for one scanner signal row.
@@ -159,10 +165,14 @@ def build_trade_card(
         Must contain: ticker, signal, price, atr.
     cfg : dict
         Full config dict.
-    xgb_model : XGBoostModel, optional
-        Pre-loaded model for SHAP computation.
+    long_model : XGBoostBinaryModel, optional
+        Pre-loaded long model for SHAP computation.
+    short_model : XGBoostBinaryModel, optional
+        Pre-loaded short model for SHAP computation.
     detector : HMMDetector, optional
         Pre-loaded HMM (used to rehydrate regime for SHAP features).
+    xgb_model : (deprecated)
+        Legacy single-model argument; used as long_model if long_model is None.
 
     Returns
     -------
@@ -175,37 +185,37 @@ def build_trade_card(
     atr        = float(signal_row["atr"])
     confidence = float(signal_row["confidence"])
 
-    s_entry    = cfg["signals"]
-    s_port     = cfg["portfolio"]
+    s_entry = cfg["signals"]
+    s_port  = cfg["portfolio"]
 
     is_long = signal == 1
 
     # ── Entry ─────────────────────────────────────────────────────────────
-    buf        = atr * s_entry["entry_buffer_atr"]
-    limit_entry = price - buf if is_long else price + buf
-    entry_price = limit_entry   # used for all downstream calcs
-    today       = date.today()
+    buf          = atr * s_entry["entry_buffer_atr"]
+    limit_entry  = price - buf if is_long else price + buf
+    entry_price  = limit_entry
+    today        = date.today()
     entry_expiry = _add_bdays(today, s_entry["entry_expiry_bars"])
 
     # ── Stop loss ─────────────────────────────────────────────────────────
-    stop_dist  = atr * s_entry["stop_multiplier"]
-    stop_loss  = entry_price - stop_dist if is_long else entry_price + stop_dist
+    stop_dist     = atr * s_entry["stop_multiplier"]
+    stop_loss     = entry_price - stop_dist if is_long else entry_price + stop_dist
     risk_per_unit = abs(entry_price - stop_loss)
-    stop_pct   = (stop_loss - entry_price) / entry_price * 100
+    stop_pct      = (stop_loss - entry_price) / entry_price * 100
 
     # ── Take profit ───────────────────────────────────────────────────────
-    reward        = risk_per_unit * s_entry["rr_ratio"]
-    take_profit   = entry_price + reward if is_long else entry_price - reward
-    target_pct    = (take_profit - entry_price) / entry_price * 100
+    reward      = risk_per_unit * s_entry["rr_ratio"]
+    take_profit = entry_price + reward if is_long else entry_price - reward
+    target_pct  = (take_profit - entry_price) / entry_price * 100
 
     # ── Trailing stop ─────────────────────────────────────────────────────
-    trail_act_dist = atr * s_entry["trailing_stop_activation_atr"]
+    trail_act_dist   = atr * s_entry["trailing_stop_activation_atr"]
     trail_activation = (
         entry_price + trail_act_dist if is_long else entry_price - trail_act_dist
     )
     trailing_distance = atr * s_entry["trailing_stop_distance_atr"]
 
-    # ── Time exit ─────────────────────────────────────────────────────────
+    # ── Time exit (config-driven, not hardcoded) ──────────────────────────
     time_exit = _add_bdays(today, s_entry["time_exit_bars"])
 
     # ── Position sizing ───────────────────────────────────────────────────
@@ -216,14 +226,20 @@ def build_trade_card(
     position_pct   = position_value / portfolio_size * 100 if portfolio_size > 0 else 0.0
 
     # ── SHAP top-5 ────────────────────────────────────────────────────────
+    # Choose which model to use for SHAP based on signal direction
+    shap_model = long_model if is_long else short_model
+    if shap_model is None and xgb_model is not None:
+        shap_model = xgb_model   # legacy fallback
+
     shap_drivers: list[dict] = []
-    if xgb_model is not None and detector is not None:
+    if shap_model is not None and detector is not None:
         try:
             df = pd.read_parquet(_processed_path(ticker))
             df = df.copy()
             df["regime"] = detector.predict_regime(df)
-            latest_feat  = df.iloc[-1][_XGB_FEATURE_COLS].to_frame().T
-            shap_drivers = _compute_shap_top5(xgb_model, latest_feat)
+            feat_cols    = [c for c in _XGB_FEATURE_COLS if c in df.columns]
+            latest_feat  = df.iloc[-1][feat_cols].to_frame().T
+            shap_drivers = _compute_shap_top5(shap_model, latest_feat)
         except Exception as exc:
             log.debug("SHAP for %s failed: %s", ticker, exc)
 
@@ -271,8 +287,11 @@ def build_trade_card(
 def build_all_trade_cards(
     signals_df: pd.DataFrame,
     cfg: dict,
-    xgb_model: XGBoostModel | None = None,
+    long_model: XGBoostBinaryModel | None = None,
+    short_model: XGBoostBinaryModel | None = None,
     detector: HMMDetector | None = None,
+    # Legacy parameter
+    xgb_model=None,
 ) -> pd.DataFrame:
     """
     Build trade cards for every row in *signals_df*.
@@ -282,8 +301,10 @@ def build_all_trade_cards(
     signals_df : pd.DataFrame
         Output of ``scanner.run_scan()``.
     cfg : dict
-    xgb_model : XGBoostModel, optional
+    long_model : XGBoostBinaryModel, optional
+    short_model : XGBoostBinaryModel, optional
     detector : HMMDetector, optional
+    xgb_model : (deprecated) legacy single-model argument.
 
     Returns
     -------
@@ -295,7 +316,13 @@ def build_all_trade_cards(
         return pd.DataFrame()
 
     cards = [
-        build_trade_card(row, cfg, xgb_model=xgb_model, detector=detector)
+        build_trade_card(
+            row, cfg,
+            long_model=long_model,
+            short_model=short_model,
+            detector=detector,
+            xgb_model=xgb_model,
+        )
         for _, row in signals_df.iterrows()
     ]
     return pd.DataFrame(cards)
@@ -308,20 +335,32 @@ def main():
     """Run scanner then build and save all trade cards."""
     logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
 
-    cfg      = _load_config()
-    model    = XGBoostModel.load(_final_model_path(), cfg)
-    detector = HMMDetector.load(cfg)
-    universe = pd.read_csv(_universe_path())
+    cfg        = _load_config()
+    long_model  = XGBoostBinaryModel.load(_long_model_path(), cfg)
+    short_model = XGBoostBinaryModel.load(_short_model_path(), cfg)
+    detector    = HMMDetector.load(cfg)
+    universe    = pd.read_csv(_universe_path())
 
     log.info("Running scanner...")
-    signals = run_scan(cfg, xgb_model=model, detector=detector, universe=universe)
+    signals = run_scan(
+        cfg,
+        long_model=long_model,
+        short_model=short_model,
+        detector=detector,
+        universe=universe,
+    )
 
     if signals.empty:
         print("No signals passed filters — no trade cards generated.")
         return
 
     log.info("Building trade cards for %d signal(s)...", len(signals))
-    cards_df = build_all_trade_cards(signals, cfg, xgb_model=model, detector=detector)
+    cards_df = build_all_trade_cards(
+        signals, cfg,
+        long_model=long_model,
+        short_model=short_model,
+        detector=detector,
+    )
 
     out_path = _trade_cards_path()
     out_path.parent.mkdir(parents=True, exist_ok=True)

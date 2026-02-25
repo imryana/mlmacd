@@ -109,6 +109,46 @@ def _add_macd(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
     )
     df["macd_divergence"] = div
 
+    # ── Crossover quality features ─────────────────────────────────────────
+
+    # Bars since last raw crossover event (0 = crossover happened this bar)
+    bar_idx = pd.Series(np.arange(len(df), dtype=float), index=df.index)
+    last_cross_idx = bar_idx.where(cross != 0).ffill()
+    df["macd_bars_since_cross"] = (bar_idx - last_cross_idx).fillna(bar_idx)
+
+    # Absolute gap between MACD line and signal (crossover strength, continuous)
+    df["macd_cross_strength"] = (macd_line - macd_signal).abs()
+
+    # MACD line position relative to zero (bull/bear territory)
+    df["macd_above_zero"] = (macd_line > 0).astype(int)
+
+    # Histogram acceleration: second derivative (is momentum expanding or fading?)
+    df["macd_hist_acceleration"] = df["macd_hist_slope_1"].diff(1)
+
+    # Zero-line crossover: MACD line crossing zero (trend-change confirmation)
+    zero_cross = pd.Series(0, index=df.index)
+    bull_zero = (macd_line > 0) & (macd_line.shift(1) <= 0)
+    bear_zero = (macd_line < 0) & (macd_line.shift(1) >= 0)
+    zero_cross[bull_zero] = 1
+    zero_cross[bear_zero] = -1
+    df["macd_zero_cross"] = (
+        zero_cross.rolling(3, min_periods=1)
+        .apply(lambda x: x[x != 0].iloc[-1] if (x != 0).any() else 0, raw=False)
+        .astype(int)
+    )
+
+    # Weekly MACD trend: is weekly MACD line above its signal line?
+    # Resampled to Friday-close weeks so dates align with trading days.
+    weekly_close = close.resample("W-FRI").last()
+    w_ema_fast = _ema(weekly_close, fast)
+    w_ema_slow = _ema(weekly_close, slow)
+    w_macd     = w_ema_fast - w_ema_slow
+    w_signal   = _ema(w_macd, sig)
+    w_bull     = (w_macd > w_signal).astype(int)
+    df["macd_weekly_bull"] = (
+        w_bull.reindex(df.index, method="ffill").fillna(0).astype(int)
+    )
+
     return df
 
 
@@ -335,6 +375,10 @@ FEATURE_COLUMNS = [
     "macd_line", "macd_signal", "macd_histogram",
     "macd_hist_slope_1", "macd_hist_slope_3",
     "macd_crossover", "macd_divergence",
+    # MACD quality / multi-timeframe
+    "macd_bars_since_cross", "macd_cross_strength",
+    "macd_above_zero", "macd_hist_acceleration",
+    "macd_zero_cross", "macd_weekly_bull",
     # RSI
     "rsi", "rsi_slope", "rsi_overbought", "rsi_oversold",
     # ADX
@@ -349,6 +393,9 @@ FEATURE_COLUMNS = [
     "volume_ratio", "obv_slope", "volume_confirmation",
     # Market context
     "rolling_return_60", "return_autocorr_20", "sector",
+    # Macro context (6 new — joined from features.macro)
+    "vix_level", "vix_pct_rank", "vix_high",
+    "spy_above_200", "spy_rsi", "spy_return_20",
 ]
 
 

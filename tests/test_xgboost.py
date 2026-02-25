@@ -15,7 +15,7 @@ import pytest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from models.xgboost_model import XGBoostModel
+from models.xgboost_model import XGBoostBinaryModel, XGBoostModel
 from models.trainer import (
     _get_feature_columns,
     _sharpe,
@@ -39,7 +39,10 @@ _CFG = {
         "hmm_n_states":              3,
         "hmm_n_iter":                50,
         "use_gpu":                   False,   # CPU for unit tests
-    }
+    },
+    "backtest": {
+        "commission_per_trade": 0.001,   # round-trip cost used in Sharpe calc
+    },
 }
 
 _N_FEATURES = 8
@@ -93,7 +96,11 @@ def _make_pooled(
 
     records = [r for _, r in rows]
     idx     = pd.DatetimeIndex([d for d, _ in rows])
-    return pd.DataFrame(records, index=idx)
+    df = pd.DataFrame(records, index=idx)
+    # Add binary label columns required by the dual-model trainer
+    df["label_long"]  = (df["forward_return"] > 0.01).astype(int)
+    df["label_short"] = (df["forward_return"] < -0.01).astype(int)
+    return df
 
 
 # ── XGBoostModel ──────────────────────────────────────────────────────────
@@ -181,7 +188,8 @@ def test_get_feature_columns_excludes_ohlcv():
     pooled = _make_pooled()
     feat_cols = _get_feature_columns(pooled)
     for bad in ("open", "high", "low", "close", "volume",
-                "ticker", "forward_return", "label"):
+                "ticker", "forward_return", "label",
+                "label_long", "label_short"):
         assert bad not in feat_cols
 
 
@@ -235,7 +243,7 @@ def test_walk_forward_output_columns():
     feat_cols = _get_feature_columns(pooled)
     wf_df, _  = run_walk_forward(pooled, _CFG, feat_cols)
     for col in ("fold", "ticker", "signal", "confidence", "actual",
-                "forward_return", "proba_short", "proba_flat", "proba_long"):
+                "forward_return", "long_proba", "short_proba"):
         assert col in wf_df.columns, f"Missing column: {col}"
 
 
@@ -262,13 +270,79 @@ def test_walk_forward_not_enough_data_raises():
         run_walk_forward(pooled, _CFG, feat_cols)
 
 
+# ── XGBoostBinaryModel ────────────────────────────────────────────────────
+
+
+def _make_y_binary(n: int = 300, seed: int = 0) -> pd.Series:
+    rng = np.random.default_rng(seed)
+    return pd.Series(rng.choice([0, 1], size=n))
+
+
+def test_binary_train_returns_self():
+    model = XGBoostBinaryModel(_CFG)
+    result = model.train(_make_X(), _make_y_binary())
+    assert result is model
+
+
+def test_binary_predict_proba_shape():
+    model = XGBoostBinaryModel(_CFG)
+    X = _make_X()
+    model.train(X, _make_y_binary())
+    proba = model.predict_proba(X.iloc[:10])
+    assert proba.shape == (10,), f"Expected (10,) got {proba.shape}"
+
+
+def test_binary_predict_proba_in_unit_interval():
+    model = XGBoostBinaryModel(_CFG)
+    X = _make_X()
+    model.train(X, _make_y_binary())
+    proba = model.predict_proba(X.iloc[:50])
+    assert ((proba >= 0) & (proba <= 1)).all()
+
+
+def test_binary_predict_signal_valid_values():
+    model = XGBoostBinaryModel(_CFG)
+    X = _make_X()
+    model.train(X, _make_y_binary())
+    signals, conf = model.predict_signal(X.iloc[:30])
+    assert set(signals).issubset({0, 1})
+    assert ((conf >= 0) & (conf <= 1)).all()
+
+
+def test_binary_save_load_consistent(tmp_path):
+    X = _make_X()
+    y = _make_y_binary()
+    model = XGBoostBinaryModel(_CFG)
+    model.train(X, y)
+
+    path = tmp_path / "binary_model.pkl"
+    model.save(path)
+    loaded = XGBoostBinaryModel.load(path, _CFG)
+
+    proba_orig   = model.predict_proba(X.iloc[:20])
+    proba_loaded = loaded.predict_proba(X.iloc[:20])
+    np.testing.assert_allclose(proba_orig, proba_loaded, atol=1e-6)
+
+
+def test_binary_scale_pos_weight_imbalanced():
+    """Training with very imbalanced data should not raise an error."""
+    rng = np.random.default_rng(99)
+    X = _make_X(500)
+    # 95% negative, 5% positive
+    y = pd.Series(rng.choice([0, 1], size=500, p=[0.95, 0.05]))
+    model = XGBoostBinaryModel(_CFG)
+    model.train(X, y)   # should not raise
+    proba = model.predict_proba(X.iloc[:5])
+    assert proba.shape == (5,)
+
+
 # ── compute_shap_importance ───────────────────────────────────────────────
 
 
 def test_shap_importance_shape():
     X = _make_X(300)
-    y = _make_y(300)
-    model = XGBoostModel(_CFG)
+    y = _make_y_binary(300)
+    model = XGBoostBinaryModel(_CFG)
     model.train(X, y)
     shap_df = compute_shap_importance(model, X)
     assert len(shap_df) == _N_FEATURES
@@ -278,8 +352,8 @@ def test_shap_importance_shape():
 
 def test_shap_importance_sorted_descending():
     X = _make_X(300)
-    y = _make_y(300)
-    model = XGBoostModel(_CFG)
+    y = _make_y_binary(300)
+    model = XGBoostBinaryModel(_CFG)
     model.train(X, y)
     shap_df = compute_shap_importance(model, X)
     values = shap_df["mean_abs_shap"].values
@@ -288,8 +362,8 @@ def test_shap_importance_sorted_descending():
 
 def test_shap_importance_non_negative():
     X = _make_X(300)
-    y = _make_y(300)
-    model = XGBoostModel(_CFG)
+    y = _make_y_binary(300)
+    model = XGBoostBinaryModel(_CFG)
     model.train(X, y)
     shap_df = compute_shap_importance(model, X)
     assert (shap_df["mean_abs_shap"] >= 0).all()

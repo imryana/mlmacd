@@ -306,6 +306,11 @@ def main():
     universe = pd.read_csv(universe_path)
     tickers = universe["ticker"].tolist()
 
+    ticker_filter = cfg["data"].get("tickers")
+    if ticker_filter:
+        tickers = [t for t in tickers if t in ticker_filter]
+        log.info("Ticker filter active: %d tickers.", len(tickers))
+
     print(f"Starting download for {len(tickers)} tickers...")
     succeeded, failed = download_all(tickers, cfg)
 

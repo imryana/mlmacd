@@ -84,11 +84,25 @@ def test_rma_warmup():
 # ── calculate_indicators tests ────────────────────────────────────────────
 
 
+_MACRO_COLS = {
+    "vix_level", "vix_pct_rank", "vix_high",
+    "spy_above_200", "spy_rsi", "spy_return_20",
+}
+
+
 def test_output_has_all_feature_columns():
-    """calculate_indicators must produce every column in FEATURE_COLUMNS."""
+    """
+    calculate_indicators must produce every non-macro column in FEATURE_COLUMNS.
+
+    The 6 macro columns (vix_*, spy_*) are joined in by features.pipeline
+    after downloading VIX/SPY data — they are NOT produced by calculate_indicators.
+    """
     df = _make_ohlcv(500)
     result = calculate_indicators(df, _CFG, sector_code=3)
-    missing = [c for c in FEATURE_COLUMNS if c not in result.columns]
+    missing = [
+        c for c in FEATURE_COLUMNS
+        if c not in result.columns and c not in _MACRO_COLS
+    ]
     assert missing == [], f"Missing columns: {missing}"
 
 
@@ -139,6 +153,7 @@ def test_binary_columns_are_0_or_1():
         "rsi_overbought", "rsi_oversold",
         "adx_trending", "golden_cross", "death_cross", "above_ema_slow",
         "volume_confirmation",
+        "macd_above_zero", "macd_weekly_bull",
     ]
     for col in binary_cols:
         unique = set(result[col].dropna().unique())
@@ -166,6 +181,30 @@ def test_volume_ratio_positive():
     result = calculate_indicators(df, _CFG)
     valid = result["volume_ratio"].dropna()
     assert (valid > 0).all()
+
+
+def test_macd_zero_cross_values():
+    """macd_zero_cross must only contain {-1, 0, 1}."""
+    df = _make_ohlcv(500)
+    result = calculate_indicators(df, _CFG)
+    unique = set(result["macd_zero_cross"].dropna().unique())
+    assert unique <= {-1, 0, 1}
+
+
+def test_macd_bars_since_cross_non_negative():
+    """macd_bars_since_cross must be >= 0 everywhere it is defined."""
+    df = _make_ohlcv(500)
+    result = calculate_indicators(df, _CFG)
+    valid = result["macd_bars_since_cross"].dropna()
+    assert (valid >= 0).all()
+
+
+def test_macd_cross_strength_non_negative():
+    """macd_cross_strength (absolute gap) must be >= 0."""
+    df = _make_ohlcv(500)
+    result = calculate_indicators(df, _CFG)
+    valid = result["macd_cross_strength"].dropna()
+    assert (valid >= 0).all()
 
 
 def test_warmup_nans_at_start():

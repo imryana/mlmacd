@@ -9,17 +9,19 @@ Pipeline
      train window = config.model.walk_forward_train_bars  unique dates
      test  window = config.model.walk_forward_test_bars   unique dates
      slide forward by test_bars each iteration
-4. Evaluate aggregate metrics and per-fold signal-weighted returns
-5. Retrain final model on the full dataset
-6. Compute SHAP feature importance
-7. Save artefacts:
-     models/saved/xgboost_final.pkl
+4. Per fold: train a separate long binary model and short binary model
+5. Combine signals: LONG when long_proba > thr, SHORT when short_proba > thr
+6. Cost-adjusted Sharpe: deduct round-trip commission from active returns
+7. Retrain final long + short models on the full dataset
+8. Compute SHAP for both models; save combined shap_importance.parquet
+9. Save artefacts:
+     models/saved/long_model.pkl
+     models/saved/short_model.pkl
      models/saved/wf_results.parquet
      models/saved/shap_importance.parquet
      models/saved/wf_metrics.json
 
-Optional: pass --tune to run 50-trial Optuna search and write best
-hyperparameters back to config.yaml.
+Optional: pass --tune to run 50-trial Optuna search (optimises signal Sharpe).
 """
 
 import argparse
@@ -39,8 +41,8 @@ from sklearn.metrics import (
     f1_score,
 )
 
-from models.xgboost_model import XGBoostModel
-from regime.hmm_detector import HMMDetector
+from models.xgboost_model import XGBoostBinaryModel, XGBoostModel
+from regime.hmm_detector import BEAR, BULL, HMMDetector
 
 log = logging.getLogger(__name__)
 
@@ -49,7 +51,7 @@ _ROOT = pathlib.Path(__file__).resolve().parents[1]
 # ── Non-feature columns (excluded from the feature matrix) ───────────────
 
 _OHLCV       = {"open", "high", "low", "close", "volume"}
-_META        = {"ticker", "forward_return", "label"}
+_META        = {"ticker", "forward_return", "label", "label_long", "label_short"}
 _NON_FEATURE = _OHLCV | _META
 
 
@@ -67,11 +69,12 @@ def _save_config(cfg: dict) -> None:
         yaml.dump(cfg, fh, default_flow_style=False, sort_keys=False)
 
 
-def _pooled_path()        -> pathlib.Path: return _ROOT / "data" / "processed" / "pooled_features.parquet"
-def _final_model_path()   -> pathlib.Path: return _ROOT / "models" / "saved" / "xgboost_final.pkl"
-def _wf_results_path()    -> pathlib.Path: return _ROOT / "models" / "saved" / "wf_results.parquet"
-def _shap_path()          -> pathlib.Path: return _ROOT / "models" / "saved" / "shap_importance.parquet"
-def _wf_metrics_path()    -> pathlib.Path: return _ROOT / "models" / "saved" / "wf_metrics.json"
+def _pooled_path()       -> pathlib.Path: return _ROOT / "data" / "processed" / "pooled_features.parquet"
+def _long_model_path()   -> pathlib.Path: return _ROOT / "models" / "saved" / "long_model.pkl"
+def _short_model_path()  -> pathlib.Path: return _ROOT / "models" / "saved" / "short_model.pkl"
+def _wf_results_path()   -> pathlib.Path: return _ROOT / "models" / "saved" / "wf_results.parquet"
+def _shap_path()         -> pathlib.Path: return _ROOT / "models" / "saved" / "shap_importance.parquet"
+def _wf_metrics_path()   -> pathlib.Path: return _ROOT / "models" / "saved" / "wf_metrics.json"
 
 
 # ── Data preparation ──────────────────────────────────────────────────────
@@ -110,7 +113,7 @@ def _get_feature_columns(df: pd.DataFrame) -> list[str]:
     """
     Return all columns that should be used as XGBoost features.
 
-    Excludes OHLCV, ticker, label, and forward_return.
+    Excludes OHLCV, ticker, label, forward_return, label_long, label_short.
 
     Parameters
     ----------
@@ -142,15 +145,18 @@ def run_walk_forward(
     feature_cols: list[str],
 ) -> tuple[pd.DataFrame, dict]:
     """
-    Run sliding-window walk-forward cross-validation.
+    Run sliding-window walk-forward cross-validation using dual binary models.
 
-    The window slides over *unique* trading dates so that every ticker
-    present on a given date is included in training/testing together.
+    Per fold:
+      - Long model  trained on label_long  (P(return > +threshold))
+      - Short model trained on label_short (P(return < -threshold))
+      - Combined signal: LONG > SHORT priority when both fire above threshold
 
     Parameters
     ----------
     df : pd.DataFrame
-        Full prepared dataset with all feature columns and ``label``.
+        Full prepared dataset with all feature columns, ``label``,
+        ``label_long``, and ``label_short``.
     cfg : dict
         Full config dict.
     feature_cols : list[str]
@@ -162,12 +168,14 @@ def run_walk_forward(
         ``(wf_results_df, aggregate_metrics)``
 
         *wf_results_df* has columns: fold, ticker, signal, confidence,
-        actual, forward_return, regime, proba_short, proba_flat, proba_long.
+        actual, forward_return, regime, long_proba, short_proba.
 
         *aggregate_metrics* is a plain dict of scalar summary statistics.
     """
     train_bars = cfg["model"]["walk_forward_train_bars"]
     test_bars  = cfg["model"]["walk_forward_test_bars"]
+    thr        = cfg["model"]["confidence_threshold"]
+    commission = 2 * cfg["backtest"]["commission_per_trade"]   # round-trip
 
     unique_dates = np.array(sorted(df.index.unique()))
     n_dates      = len(unique_dates)
@@ -204,36 +212,55 @@ def run_walk_forward(
             continue
 
         X_train = train_df[feature_cols]
-        y_train = train_df["label"]
         X_test  = test_df[feature_cols]
-        y_test  = test_df["label"]
 
-        model = XGBoostModel(cfg)
-        model.train(X_train, y_train)
+        # Upweight MACD crossover bars 4x so models specialise on them
+        if "macd_crossover" in train_df.columns:
+            train_weights = np.where(train_df["macd_crossover"].abs() > 0, 4.0, 1.0)
+        else:
+            train_weights = None
 
-        proba           = model.predict_proba(X_test)
-        signals, conf   = model.predict_signal(X_test)
+        # ── Long model ────────────────────────────────────────────────────
+        long_m = XGBoostBinaryModel(cfg)
+        long_m.train(X_train, train_df["label_long"], sample_weight=train_weights)
+        long_proba = long_m.predict_proba(X_test)   # P(return > +thr)
+
+        # ── Short model ───────────────────────────────────────────────────
+        short_m = XGBoostBinaryModel(cfg)
+        short_m.train(X_train, train_df["label_short"], sample_weight=train_weights)
+        short_proba = short_m.predict_proba(X_test)  # P(return < -thr)
+
+        # ── Combined signal: LONG priority when both fire ─────────────────
+        signal = np.where(long_proba  > thr,  1,
+                 np.where(short_proba > thr, -1, 0))
+
+        # Suppress short signals outside bear regime
+        if "regime" in test_df.columns:
+            regime_arr = test_df["regime"].values
+            signal = np.where((signal == -1) & (regime_arr != BEAR), 0, signal)
+
+        confidence = np.where(signal ==  1, long_proba,
+                     np.where(signal == -1, short_proba, 0.0))
 
         fold_df = pd.DataFrame(
             {
                 "fold":           fold,
                 "ticker":         test_df["ticker"].values,
-                "signal":         signals,
-                "confidence":     conf,
-                "actual":         y_test.values,
+                "signal":         signal,
+                "confidence":     confidence,
+                "actual":         test_df["label"].values,
                 "forward_return": test_df["forward_return"].values,
                 "regime":         test_df["regime"].values if "regime" in test_df else 0,
-                "proba_short":    proba[:, 0],
-                "proba_flat":     proba[:, 1],
-                "proba_long":     proba[:, 2],
+                "long_proba":     long_proba,
+                "short_proba":    short_proba,
             },
             index=test_df.index,
         )
         all_results.append(fold_df)
 
         # Per-fold logging
-        acc = accuracy_score(y_test, signals)
-        sig_returns = signals * test_df["forward_return"].values
+        acc = accuracy_score(test_df["label"].values, signal)
+        sig_returns = signal * test_df["forward_return"].values
         log.info("Fold %2d | acc=%.3f | sig_ret=%.4f", fold, acc, sig_returns.mean())
 
     if not all_results:
@@ -247,23 +274,35 @@ def run_walk_forward(
     y_pred = wf_df["signal"].values
     sig_ret = (wf_df["signal"] * wf_df["forward_return"]).values
 
-    # Only evaluate non-flat signals for signal-quality metrics
+    # Cost-adjusted Sharpe: only active signals, minus commission
     active_mask = y_pred != 0
-    active_ret  = sig_ret[active_mask]
+    active_ret  = sig_ret[active_mask] - commission
+
+    # Accuracy for each binary model
+    long_mask   = wf_df["label_long"].values  if "label_long"  in wf_df.columns else None
+    short_mask  = wf_df["label_short"].values if "label_short" in wf_df.columns else None
+
+    long_acc  = float(accuracy_score(wf_df["actual"].values == 1,
+                                     wf_df["long_proba"].values > thr))
+    short_acc = float(accuracy_score(wf_df["actual"].values == -1,
+                                     wf_df["short_proba"].values > thr))
 
     metrics = {
-        "n_folds":           n_folds,
-        "total_test_rows":   int(len(wf_df)),
-        "accuracy":          float(accuracy_score(y_true, y_pred)),
-        "f1_short":          float(f1_score(y_true, y_pred, labels=[-1], average="macro", zero_division=0)),
-        "f1_flat":           float(f1_score(y_true, y_pred, labels=[ 0], average="macro", zero_division=0)),
-        "f1_long":           float(f1_score(y_true, y_pred, labels=[ 1], average="macro", zero_division=0)),
-        "f1_weighted":       float(f1_score(y_true, y_pred, average="weighted", zero_division=0)),
-        "confusion_matrix":  confusion_matrix(y_true, y_pred, labels=[-1, 0, 1]).tolist(),
-        "signal_hit_rate":   float((active_ret > 0).mean()) if len(active_ret) else 0.0,
+        "n_folds":            n_folds,
+        "total_test_rows":    int(len(wf_df)),
+        "accuracy":           float(accuracy_score(y_true, y_pred)),
+        "long_accuracy":      long_acc,
+        "short_accuracy":     short_acc,
+        "f1_short":           float(f1_score(y_true, y_pred, labels=[-1], average="macro", zero_division=0)),
+        "f1_flat":            float(f1_score(y_true, y_pred, labels=[ 0], average="macro", zero_division=0)),
+        "f1_long":            float(f1_score(y_true, y_pred, labels=[ 1], average="macro", zero_division=0)),
+        "f1_weighted":        float(f1_score(y_true, y_pred, average="weighted", zero_division=0)),
+        "confusion_matrix":   confusion_matrix(y_true, y_pred, labels=[-1, 0, 1]).tolist(),
+        "signal_hit_rate":    float((active_ret > 0).mean()) if len(active_ret) else 0.0,
         "mean_signal_return": float(active_ret.mean()) if len(active_ret) else 0.0,
-        "sharpe_signal":     _sharpe(active_ret),
-        "pct_signals":       float(active_mask.mean()),
+        "sharpe_signal":      _sharpe(active_ret),   # cost-adjusted
+        "pct_signals":        float(active_mask.mean()),
+        "commission_per_trade": commission,
     }
 
     return wf_df, metrics
@@ -272,22 +311,23 @@ def run_walk_forward(
 # ── SHAP importance ───────────────────────────────────────────────────────
 
 def compute_shap_importance(
-    model: XGBoostModel,
+    model: XGBoostBinaryModel,
     X: pd.DataFrame,
     max_rows: int = 5000,
+    label: str = "",
 ) -> pd.DataFrame:
     """
     Compute mean |SHAP| per feature using TreeExplainer.
 
-    For multi-class models, SHAP values are averaged across classes.
+    For binary models, SHAP values are a single (n_samples, n_features) array.
 
     Parameters
     ----------
-    model : XGBoostModel
+    model : XGBoostBinaryModel (or XGBoostModel)
     X : pd.DataFrame
-        Feature matrix (full dataset or a representative sample).
     max_rows : int
-        Maximum number of rows to use for SHAP computation (speed/memory).
+    label : str
+        Optional prefix added to help distinguish long vs short results.
 
     Returns
     -------
@@ -302,19 +342,24 @@ def compute_shap_importance(
         explainer   = shap.TreeExplainer(model.model)
         shap_values = explainer.shap_values(X)
 
-    # shap_values: list of (n_samples, n_features) arrays  — one per class
-    # or a single (n_samples, n_features, n_classes) array in newer shap
+    # Binary model: shap_values is (n_samples, n_features) or list of two
     if isinstance(shap_values, list):
-        mean_abs = np.mean([np.abs(sv).mean(axis=0) for sv in shap_values], axis=0)
-    else:
-        # shape (n_samples, n_features, n_classes)
+        # Older shap: list of [neg_class, pos_class] — use positive class
+        mean_abs = np.abs(shap_values[-1]).mean(axis=0)
+    elif shap_values.ndim == 3:
+        # (n_samples, n_features, n_classes)
         mean_abs = np.abs(shap_values).mean(axis=(0, 2))
+    else:
+        # (n_samples, n_features)
+        mean_abs = np.abs(shap_values).mean(axis=0)
 
     importance = (
         pd.DataFrame({"feature": list(X.columns), "mean_abs_shap": mean_abs})
         .sort_values("mean_abs_shap", ascending=False)
         .reset_index(drop=True)
     )
+    if label:
+        importance.insert(0, "model", label)
     return importance
 
 
@@ -327,10 +372,7 @@ def tune_hyperparameters(
     n_trials: int = 50,
 ) -> dict:
     """
-    Run an Optuna study to maximise walk-forward signal Sharpe ratio.
-
-    Searches over XGBoost hyperparameters.  Best parameters are written
-    back to *cfg* (in-memory only; caller should persist to config.yaml).
+    Run an Optuna study to maximise walk-forward cost-adjusted signal Sharpe.
 
     Parameters
     ----------
@@ -348,7 +390,7 @@ def tune_hyperparameters(
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     def objective(trial: "optuna.Trial") -> float:
-        trial_cfg = json.loads(json.dumps(cfg))   # deep copy
+        trial_cfg = json.loads(json.dumps(cfg))
         m = trial_cfg["model"]
         m["xgb_max_depth"]        = trial.suggest_int("max_depth",        3, 9)
         m["xgb_learning_rate"]    = trial.suggest_float("learning_rate",  0.01, 0.3, log=True)
@@ -368,7 +410,6 @@ def tune_hyperparameters(
     best = study.best_params
     log.info("Best Optuna params: %s  (Sharpe=%.4f)", best, study.best_value)
 
-    # Write best params back to cfg
     cfg["model"]["xgb_max_depth"]        = best["max_depth"]
     cfg["model"]["xgb_learning_rate"]    = best["learning_rate"]
     cfg["model"]["xgb_n_estimators"]     = best["n_estimators"]
@@ -383,7 +424,7 @@ def tune_hyperparameters(
 def run_training_pipeline(
     cfg: dict,
     tune: bool = False,
-) -> tuple[XGBoostModel, pd.DataFrame, dict]:
+) -> tuple[XGBoostBinaryModel, XGBoostBinaryModel, pd.DataFrame, dict]:
     """
     Execute the full model training pipeline end-to-end.
 
@@ -396,8 +437,8 @@ def run_training_pipeline(
 
     Returns
     -------
-    tuple[XGBoostModel, pd.DataFrame, dict]
-        ``(final_model, wf_results_df, aggregate_metrics)``
+    tuple[XGBoostBinaryModel, XGBoostBinaryModel, pd.DataFrame, dict]
+        ``(long_model, short_model, wf_results_df, aggregate_metrics)``
     """
     # ── 1. Load pooled features ─────────────────────────────────────────
     pooled_path = _pooled_path()
@@ -413,53 +454,92 @@ def run_training_pipeline(
     pooled = _add_regime_column(pooled, cfg)
     log.info("Regime distribution: %s", pooled["regime"].value_counts().to_dict())
 
-    # ── 3. Derive feature list ──────────────────────────────────────────
+    # ── 2b. MACD-regime alignment feature ───────────────────────────────
+    # 1 when a bullish MACD cross aligns with a bull regime, or a bearish
+    # cross aligns with a bear regime — both signals pointing the same way.
+    pooled["macd_regime_alignment"] = (
+        ((pooled["macd_crossover"] == 1)  & (pooled["regime"] == BULL)) |
+        ((pooled["macd_crossover"] == -1) & (pooled["regime"] == BEAR))
+    ).astype(int)
+    log.info(
+        "macd_regime_alignment: %d aligned bars (%.1f%% of total).",
+        pooled["macd_regime_alignment"].sum(),
+        pooled["macd_regime_alignment"].mean() * 100,
+    )
+
+    # ── 3. Ensure binary label columns exist ────────────────────────────
+    if "label_long" not in pooled.columns or "label_short" not in pooled.columns:
+        raise ValueError(
+            "Pooled features missing label_long / label_short columns. "
+            "Re-run `python -m features.pipeline` first."
+        )
+
+    # ── 4. Derive feature list ──────────────────────────────────────────
     feature_cols = _get_feature_columns(pooled)
     log.info("Feature columns (%d): %s", len(feature_cols), feature_cols)
 
-    # ── 4. Optional Optuna tuning ────────────────────────────────────────
+    # ── 5. Optional Optuna tuning ────────────────────────────────────────
     if tune:
         log.info("Starting Optuna hyperparameter search (%d trials)...", 50)
         best_params = tune_hyperparameters(pooled, cfg, feature_cols, n_trials=50)
         _save_config(cfg)
         log.info("Best params saved to config.yaml: %s", best_params)
 
-    # ── 5. Walk-forward cross-validation ────────────────────────────────
+    # ── 6. Walk-forward cross-validation ────────────────────────────────
     wf_df, metrics = run_walk_forward(pooled, cfg, feature_cols)
 
-    # Persist walk-forward results
     _wf_results_path().parent.mkdir(parents=True, exist_ok=True)
     wf_df.to_parquet(_wf_results_path())
     log.info("Walk-forward results saved: %d rows.", len(wf_df))
 
-    # ── 6. Retrain final model on full dataset ───────────────────────────
+    # ── 7. Retrain final models on full dataset ──────────────────────────
     X_full = pooled[feature_cols]
-    y_full = pooled["label"]
+    full_weights = (
+        np.where(pooled["macd_crossover"].abs() > 0, 4.0, 1.0)
+        if "macd_crossover" in pooled.columns else None
+    )
 
-    final_model = XGBoostModel(cfg)
-    final_model.train(X_full, y_full)
-    final_model.save(_final_model_path())
-    log.info("Final model saved to %s.", _final_model_path())
+    long_model = XGBoostBinaryModel(cfg)
+    long_model.train(X_full, pooled["label_long"], sample_weight=full_weights)
+    long_model.save(_long_model_path())
+    log.info("Long model saved to %s.", _long_model_path())
 
-    # ── 7. SHAP feature importance ───────────────────────────────────────
-    log.info("Computing SHAP importance...")
-    shap_df = compute_shap_importance(final_model, X_full)
-    shap_df.to_parquet(_shap_path(), index=False)
-    log.info("SHAP importance saved.")
+    short_model = XGBoostBinaryModel(cfg)
+    short_model.train(X_full, pooled["label_short"], sample_weight=full_weights)
+    short_model.save(_short_model_path())
+    log.info("Short model saved to %s.", _short_model_path())
 
-    # ── 8. Persist metrics ───────────────────────────────────────────────
+    # ── 8. SHAP feature importance (combined) ────────────────────────────
+    log.info("Computing SHAP importance for long model...")
+    shap_long  = compute_shap_importance(long_model,  X_full, label="long")
+
+    log.info("Computing SHAP importance for short model...")
+    shap_short = compute_shap_importance(short_model, X_full, label="short")
+
+    # Average mean_abs_shap across both models for combined ranking
+    shap_combined = (
+        pd.concat([shap_long, shap_short])
+        .groupby("feature", as_index=False)["mean_abs_shap"]
+        .mean()
+        .sort_values("mean_abs_shap", ascending=False)
+        .reset_index(drop=True)
+    )
+    shap_combined.to_parquet(_shap_path(), index=False)
+    log.info("SHAP importance saved (%d features).", len(shap_combined))
+
+    # ── 9. Persist metrics ───────────────────────────────────────────────
     with open(_wf_metrics_path(), "w") as fh:
         json.dump(metrics, fh, indent=2)
     log.info("Walk-forward metrics saved.")
 
-    return final_model, wf_df, metrics
+    return long_model, short_model, wf_df, metrics
 
 
 # ── Entry point ───────────────────────────────────────────────────────────
 
 def main():
-    """Train the XGBoost model with walk-forward CV, then save artefacts."""
-    parser = argparse.ArgumentParser(description="Train the XGBoost signal model.")
+    """Train the dual binary XGBoost models with walk-forward CV, save artefacts."""
+    parser = argparse.ArgumentParser(description="Train the XGBoost signal models.")
     parser.add_argument(
         "--tune", action="store_true",
         help="Run Optuna hyperparameter search (50 trials) before training.",
@@ -469,25 +549,28 @@ def main():
     logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
     cfg = _load_config()
 
-    final_model, wf_df, metrics = run_training_pipeline(cfg, tune=args.tune)
+    long_model, short_model, wf_df, metrics = run_training_pipeline(cfg, tune=args.tune)
 
     print("\n--- Walk-Forward Results ---")
-    print(f"  Folds          : {metrics['n_folds']}")
-    print(f"  Test rows      : {metrics['total_test_rows']:,}")
-    print(f"  Accuracy       : {metrics['accuracy']:.3f}")
-    print(f"  F1 (weighted)  : {metrics['f1_weighted']:.3f}")
+    print(f"  Folds           : {metrics['n_folds']}")
+    print(f"  Test rows       : {metrics['total_test_rows']:,}")
+    print(f"  Accuracy        : {metrics['accuracy']:.3f}")
+    print(f"  Long  accuracy  : {metrics['long_accuracy']:.3f}")
+    print(f"  Short accuracy  : {metrics['short_accuracy']:.3f}")
+    print(f"  F1 (weighted)   : {metrics['f1_weighted']:.3f}")
     print(f"  F1 short/flat/long: {metrics['f1_short']:.3f} / {metrics['f1_flat']:.3f} / {metrics['f1_long']:.3f}")
-    print(f"  Signal hit rate: {metrics['signal_hit_rate']:.3f}")
-    print(f"  Mean sig return: {metrics['mean_signal_return']:.5f}")
-    print(f"  Signal Sharpe  : {metrics['sharpe_signal']:.3f}")
+    print(f"  Signal hit rate : {metrics['signal_hit_rate']:.3f}")
+    print(f"  Mean sig return : {metrics['mean_signal_return']:.5f}  (cost-adjusted)")
+    print(f"  Signal Sharpe   : {metrics['sharpe_signal']:.3f}  (cost-adjusted)")
     print(f"  % bars signalled: {metrics['pct_signals']:.1%}")
+    print(f"  Commission/trade: {metrics['commission_per_trade']:.4f}")
 
     print("\n  Confusion matrix (rows=actual, cols=pred | short/flat/long):")
     cm = np.array(metrics["confusion_matrix"])
     print(f"  {cm}")
 
     shap_df = pd.read_parquet(_shap_path())
-    print("\n--- Top 10 Features (SHAP) ---")
+    print("\n--- Top 10 Features (SHAP, combined) ---")
     print(shap_df.head(10).to_string(index=False))
 
 

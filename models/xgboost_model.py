@@ -204,6 +204,161 @@ class XGBoostModel:
         return mapping[encoded]
 
 
+class XGBoostBinaryModel:
+    """
+    Binary XGBoost classifier for separate long / short signal models.
+
+    Identical public interface to :class:`XGBoostModel` but uses
+    ``binary:logistic`` and returns a scalar P(positive) from
+    :meth:`predict_proba`.
+
+    Parameters
+    ----------
+    cfg : dict
+        Full config dict from config.yaml.
+    """
+
+    def __init__(self, cfg: dict):
+        m = cfg["model"]
+
+        use_gpu    = m.get("use_gpu", False)
+        xgb_version = tuple(int(x) for x in xgb.__version__.split(".")[:2])
+
+        if use_gpu:
+            if xgb_version >= (2, 0):
+                device_kwargs = {"device": "cuda", "tree_method": "hist"}
+            else:
+                device_kwargs = {"tree_method": "gpu_hist"}
+            log.info("XGBoostBinary GPU training enabled.")
+        else:
+            device_kwargs = {"tree_method": "hist"}
+
+        self._xgb_params = {
+            "max_depth":            m["xgb_max_depth"],
+            "learning_rate":        m["xgb_learning_rate"],
+            "n_estimators":         m["xgb_n_estimators"],
+            "subsample":            m["xgb_subsample"],
+            "min_child_weight":     m["xgb_min_child_weight"],
+            "early_stopping_rounds": m["xgb_early_stopping_rounds"],
+            "objective":            "binary:logistic",
+            "eval_metric":          "logloss",
+            "verbosity":            0,
+            **device_kwargs,
+        }
+        self.model: Optional[xgb.XGBClassifier] = None
+        self._feature_names: Optional[list[str]] = None
+
+    def train(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        X_val: Optional[pd.DataFrame] = None,
+        y_val: Optional[pd.Series]    = None,
+        sample_weight: Optional[np.ndarray] = None,
+    ) -> "XGBoostBinaryModel":
+        """
+        Fit the binary XGBoost classifier.
+
+        ``y`` must be in {0, 1}.  ``scale_pos_weight`` is computed
+        automatically to handle class imbalance.
+
+        Parameters
+        ----------
+        X : pd.DataFrame
+        y : pd.Series
+            Binary labels in {0, 1}.
+        X_val, y_val : optional
+            Validation set for early stopping.
+        sample_weight : np.ndarray, optional
+            Per-sample training weights.  Applied to the training split only.
+
+        Returns
+        -------
+        self
+        """
+        self._feature_names = list(X.columns)
+
+        n_neg = int((y == 0).sum())
+        n_pos = int((y == 1).sum())
+        scale_pos_weight = n_neg / n_pos if n_pos > 0 else 1.0
+
+        self.model = xgb.XGBClassifier(
+            **self._xgb_params,
+            scale_pos_weight=scale_pos_weight,
+        )
+
+        if X_val is None or y_val is None:
+            split   = max(1, int(len(X) * 0.9))
+            X_tr, X_vl = X.iloc[:split], X.iloc[split:]
+            y_tr, y_vl = y.iloc[:split], y.iloc[split:]
+            w_tr = sample_weight[:split] if sample_weight is not None else None
+        else:
+            X_tr, X_vl = X, X_val
+            y_tr, y_vl = y, y_val
+            w_tr = sample_weight
+
+        self.model.fit(
+            X_tr, y_tr,
+            sample_weight=w_tr,
+            eval_set=[(X_vl, y_vl)],
+            verbose=False,
+        )
+        return self
+
+    def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
+        """
+        Return P(positive class) for each sample in *X*.
+
+        Returns
+        -------
+        np.ndarray, shape (n_samples,)
+            Probability of the positive class (return > threshold).
+        """
+        proba2d = self.model.predict_proba(X)   # (n, 2): [P(neg), P(pos)]
+        return proba2d[:, 1]
+
+    def predict_signal(
+        self, X: pd.DataFrame
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Return (signal, confidence) for each row in *X*.
+
+        ``signal`` is 1 if P(positive) > 0.5, else 0.
+        ``confidence`` is P(positive).
+
+        Returns
+        -------
+        tuple[np.ndarray, np.ndarray]
+            (signals, confidences), each of shape (n_samples,).
+        """
+        proba      = self.predict_proba(X)
+        signals    = (proba > 0.5).astype(int)
+        return signals, proba
+
+    def save(self, path: pathlib.Path) -> None:
+        """Serialise the fitted model to *path* using joblib."""
+        path = pathlib.Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        joblib.dump(
+            {"model": self.model, "feature_names": self._feature_names,
+             "type": "binary"},
+            path,
+        )
+        log.info("Binary model saved to %s", path)
+
+    @classmethod
+    def load(cls, path: pathlib.Path, cfg: dict) -> "XGBoostBinaryModel":
+        """Deserialise a saved binary model from *path*."""
+        data     = joblib.load(path)
+        instance = cls.__new__(cls)
+        # Reconstruct minimal attributes
+        instance._xgb_params    = {}
+        instance.model          = data["model"]
+        instance._feature_names = data.get("feature_names")
+        log.info("Binary model loaded from %s", path)
+        return instance
+
+
 # ── entry point ───────────────────────────────────────────────────────────
 
 
