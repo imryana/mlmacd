@@ -220,8 +220,8 @@ def run_weekly_retrain(cfg: dict) -> None:
 
         # ── Step 4: retrain XGBoost ───────────────────────────────────────
         log.info("[retrain] Retraining XGBoost (walk-forward)…")
-        from models.trainer import run_walk_forward
-        run_walk_forward(cfg)
+        from models.trainer import run_training_pipeline
+        run_training_pipeline(cfg)
 
         # ── Step 5: load new Sharpe ───────────────────────────────────────
         if _METRICS_PATH.exists():

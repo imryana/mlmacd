@@ -30,7 +30,7 @@ from features.indicators import FEATURE_COLUMNS
 from features.macro import compute_macro_features
 from models.trainer import _get_feature_columns
 from models.xgboost_model import XGBoostBinaryModel
-from regime.hmm_detector import BEAR, CHOPPY, HMMDetector
+from regime.hmm_detector import BEAR, BULL, CHOPPY, HMMDetector
 
 log = logging.getLogger(__name__)
 
@@ -68,8 +68,8 @@ def _short_model_path() -> pathlib.Path:
 
 # ── Feature column helper ─────────────────────────────────────────────────
 
-#: All feature columns fed to XGBoost (indicators + macro + regime)
-_XGB_FEATURE_COLS = FEATURE_COLUMNS + ["regime"]
+#: All feature columns fed to XGBoost (indicators + macro + regime + derived)
+_XGB_FEATURE_COLS = FEATURE_COLUMNS + ["regime", "macd_regime_alignment"]
 
 
 # ── Signal name helper ────────────────────────────────────────────────────
@@ -199,6 +199,13 @@ def run_scan(
         latest   = df.iloc[-1].copy()
         for col, val in latest_macro.items():
             latest[col] = val
+        # Compute derived feature: MACD cross aligned with HMM regime
+        crossover = latest.get("macd_crossover", 0)
+        regime_val = latest.get("regime", -1)
+        latest["macd_regime_alignment"] = int(
+            (crossover == 1 and regime_val == BULL) or
+            (crossover == -1 and regime_val == BEAR)
+        )
         feat_cols = [c for c in _XGB_FEATURE_COLS if c in latest.index]
         feat_row  = latest[feat_cols].to_frame().T
 
